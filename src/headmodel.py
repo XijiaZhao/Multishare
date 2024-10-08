@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from src.backbone2 import TimeSeriesTransformer
+from src.backboneTorch import TimeSeriesTransformer
 
 class Instance_Superivsion_Head(nn.Module):
     def __init__(self, in_dim, hidden_dim, out_dim, pred_hidden_dim=0, nlayers=2, proj_bn=False, pred_bn=False, norm_before_pred=False):

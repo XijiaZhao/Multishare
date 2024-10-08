@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 import math
 from src.headmodel import get_model
-from src.objective2 import get_multi_granular_loss
+from src.loss import get_multi_granular_loss
 from src.timedataloader import create_time_series_dataloader
 import numpy as np
 import matplotlib.pyplot as plt
