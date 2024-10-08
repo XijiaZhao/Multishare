@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,7 +15,6 @@ def trunc_normal_(tensor, mean=0., std=1.):
         return tensor
 
 class Mlp(nn.Module):
-    # MLP module 
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, dropout=0.):
         super().__init__()
         out_features = out_features or in_features
@@ -28,6 +28,20 @@ class Mlp(nn.Module):
         x = self.dropout(self.act(self.fc1(x)))
         x = self.dropout(self.fc2(x))
         return x
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, embed_dim, max_len=5000):
+        super().__init__()
+        self.pe = torch.zeros(max_len, embed_dim).float()
+        position = torch.arange(0, max_len).unsqueeze(1).float()
+        div_term = torch.exp(torch.arange(0, embed_dim, 2).float() * -(math.log(10000.0) / embed_dim))
+        
+        self.pe[:, 0::2] = torch.sin(position * div_term)  
+        self.pe[:, 1::2] = torch.cos(position * div_term)
+        self.pe = self.pe.unsqueeze(0)  
+    
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1), :].to(x.device)
 
 class TimeSeriesTransformer(nn.Module):
     # Transformer
@@ -48,12 +62,9 @@ class TimeSeriesTransformer(nn.Module):
         self.embed_dim = embed_dim
         self.num_classes = num_classes
         self.input_projection = nn.Linear(input_dim, embed_dim)
-        
-        # Initializations
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         trunc_normal_(self.cls_token, std=0.02)
-        self.pos_embed = nn.Parameter(torch.zeros(1, max_len + 1, embed_dim))
-        trunc_normal_(self.pos_embed, std=0.02)
+        self.pos_encoding = PositionalEncoding(embed_dim, max_len)
         self.pos_drop = nn.Dropout(p=dropout)
         
         # Transformer encoder layers 
@@ -67,50 +78,41 @@ class TimeSeriesTransformer(nn.Module):
         self.blocks = nn.TransformerEncoder(encoder_layer, num_layers=depth)
         self.norm = nn.LayerNorm(embed_dim)
 
-        # Classification head
+        # Classification
         self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
-        # Relation blocks for local group supervision
+        # Relation blocks for LG
         self.num_relation_blocks = num_relation_blocks
         if num_relation_blocks > 0:
-            self.relation_blocks = nn.ModuleList([
-                nn.TransformerEncoder(
-                    nn.TransformerEncoderLayer(
-                        d_model=embed_dim, 
-                        nhead=num_heads, 
-                        dim_feedforward=int(embed_dim * mlp_ratio), 
-                        dropout=dropout,
-                        activation='relu'
-                    ), num_layers=1
-                ) for _ in range(num_relation_blocks)
-            ])
+            self.relation_blocks = nn.ModuleList([nn.TransformerEncoder(
+                nn.TransformerEncoderLayer(
+                    d_model=embed_dim, 
+                    nhead=num_heads, 
+                    dim_feedforward=int(embed_dim * mlp_ratio), 
+                    dropout=dropout,
+                    activation='relu'
+                ), num_layers=1) for _ in range(num_relation_blocks)])
 
     def forward(self, x, return_all=False, local_group_memory_inputs=None):
         B, N, _ = x.shape
-        x = self.input_projection(x)  # Shape: (B, N, embed_dim)
-        
-        # Add class token
-        cls_tokens = self.cls_token.expand(B, -1, -1)  # Shape: (B, 1, embed_dim)
+        x = self.input_projection(x)  #(B, N, embed_dim)
+        cls_tokens = self.cls_token.expand(B, -1, -1)  # (B, 1, embed_dim)
         x = torch.cat((cls_tokens, x), dim=1)  # Shape: (B, N+1, embed_dim)
-        
-        # Positional encodings
-        pos_embed = self.pos_embed[:, :N+1, :]
-        x = x + pos_embed  # Shape: (B, N+1, embed_dim)
+        x = self.pos_encoding(x)  
         x = self.pos_drop(x)
         x = self.blocks(x)
 
-        # Process with relation blocks
+        # If relation blocks applicable
         if self.num_relation_blocks > 0:
             mem = local_group_memory_inputs.get("mem")
             if mem is not None:
                 m, _ = mem(x.mean(1))
                 rx = torch.cat((x.mean(1).unsqueeze(1), m), dim=1)
             else:
-                rx = x.mean(1).unsqueeze(1)  # use the mean of the sequence as class token
+                rx = x.mean(1).unsqueeze(1)  # Use the mean of the sequence as class token
             for blk in self.relation_blocks:
                 rx = blk(rx)
             relation_out = self.norm(rx[:, 0])
-            #print(relation_out.shape)
         else:
             relation_out = self.norm(x.mean(1))
 

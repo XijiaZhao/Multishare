@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from backboneTorch import TimeSeriesTransformer
+from src.backbone2 import TimeSeriesTransformer
 
 class Instance_Superivsion_Head(nn.Module):
     def __init__(self, in_dim, hidden_dim, out_dim, pred_hidden_dim=0, nlayers=2, proj_bn=False, pred_bn=False, norm_before_pred=False):
@@ -194,15 +194,16 @@ class Mugs_Wrapper(nn.Module):
         class_tokens = torch.cat(class_tokens, dim=0)  # (B * num_crops, D)
         memory_tokens = torch.cat(memory_tokens, dim=0)  # (B * num_crops, D)
         mean_patch_tokens = torch.cat(mean_patch_tokens, dim=0) if mean_patch_tokens else torch.empty(0).to(x[0].device)
+        #print(f'csize:{class_tokens.size()},psize:{mean_patch_tokens.size()}')
 
         # Instance supervision head
-        instance_output = self.instance_head(class_tokens, return_target=return_target)
+        instance_output = self.instance_head(mean_patch_tokens, return_target=return_target)
 
         # Local group supervision head
-        local_group_output = self.local_group_head(memory_tokens, return_target=return_target)
+        local_group_output = self.local_group_head(mean_patch_tokens, return_target=return_target)
 
         # Group supervision head
-        group_output = self.group_head(class_tokens)
+        group_output = self.group_head(mean_patch_tokens)
 
         return instance_output, local_group_output, group_output, mean_patch_tokens.detach()
 
@@ -237,22 +238,22 @@ def get_model(args):
 
     # Define the heads
     student_instance_head = Instance_Superivsion_Head(
-        in_dim=256,
+        in_dim=512,
         hidden_dim=256,
         out_dim=args.instance_out_dim,
         pred_hidden_dim=256,
-        nlayers=3,
+        nlayers=2,
         proj_bn=args.use_bn_in_head,
         pred_bn=False,
         norm_before_pred=args.norm_before_pred,
     )
 
     teacher_instance_head = Instance_Superivsion_Head(
-        in_dim=256,
+        in_dim=512,
         hidden_dim=256,
         out_dim=args.instance_out_dim,
         pred_hidden_dim=0,  # Teacher does not have predictor
-        nlayers=3,
+        nlayers=2,
         proj_bn=args.use_bn_in_head,
         pred_bn=False,
         norm_before_pred=args.norm_before_pred,
@@ -260,22 +261,22 @@ def get_model(args):
 
     # Local group heads
     student_local_group_head = Local_Group_Superivsion_Head(
-        in_dim=256,
+        in_dim=512,
         hidden_dim=256,
         out_dim=args.local_group_out_dim,
         pred_hidden_dim=256,
-        nlayers=3,
+        nlayers=2,
         proj_bn=args.use_bn_in_head,
         pred_bn=False,
         norm_before_pred=args.norm_before_pred,
     )
 
     teacher_local_group_head = Local_Group_Superivsion_Head(
-        in_dim=256,
+        in_dim=512,
         hidden_dim=256,
         out_dim=args.local_group_out_dim,
         pred_hidden_dim=0,  # Teacher does not have predictor
-        nlayers=3,
+        nlayers=2,
         proj_bn=args.use_bn_in_head,
         pred_bn=False,
         norm_before_pred=args.norm_before_pred,
@@ -283,21 +284,21 @@ def get_model(args):
 
     # Group heads
     student_group_head = Group_Superivsion_Head(
-        in_dim=256,
+        in_dim=512,
         out_dim=args.group_out_dim,
         hidden_dim=256,
         bottleneck_dim=args.group_bottleneck_dim,
-        nlayers=3,
+        nlayers=2,
         use_bn=args.use_bn_in_head,
         norm_last_layer=args.norm_last_layer,
     )
 
     teacher_group_head = Group_Superivsion_Head(
-        in_dim=256,
+        in_dim=512,
         out_dim=args.group_out_dim,
         hidden_dim=256,
         bottleneck_dim=args.group_bottleneck_dim,
-        nlayers=3,
+        nlayers=2,
         use_bn=args.use_bn_in_head,
         norm_last_layer=args.norm_last_layer,
     )

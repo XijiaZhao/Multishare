@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 import math
 from src.headmodel import get_model
-from src.objective import get_multi_granular_loss
+from src.objective2 import get_multi_granular_loss
 from src.timedataloader import create_time_series_dataloader
 import numpy as np
 
@@ -36,7 +36,7 @@ def train_mugs(args):
         pick_one=True,
         partial=True,
         partial_type='last',
-        N=45,
+        N=20,
         shuffle=True
     )
     print(f"Data loaded: there are {len(time_series_loader.dataset)} sequences.")
@@ -64,7 +64,12 @@ def train_mugs(args):
     all_losses, all_weights = get_multi_granular_loss(args)
     #optimizer = optim.Adam(student.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     optimizer = optim.Adam(student.parameters(), lr=args.lr)
-
+    for name, param in teacher.named_parameters():
+        print(f"Teacher Layer: {name} | Size: {param.size()} | Requires Grad: {param.requires_grad}")
+    print("\n")
+    for name, param in student.named_parameters():
+        print(f"Student Layer: {name} | Size: {param.size()} | Requires Grad: {param.requires_grad}")
+    print("\n")
     # Optionally resume training
     start_epoch = 0
     if os.path.isfile(os.path.join(args.output_dir, "checkpoint.pth")):
@@ -149,16 +154,14 @@ def train_one_epoch(
 
     for batch_idx, batch in enumerate(data_loader):
         target_data_padde, positive_data_padde, target_lengths, positive_lengths, vspotid_list, positive_vspotid_list = batch
-        #plot_time_series(target_data_padde, positive_data_padde, batch_idx)
-        target_data_padded = target_data_padde[:,:,2:3].to(device)  # Shape: (Batch, Length, 1)
-        positive_data_padded = positive_data_padde[:,:,2:3].to(device)  # Shape: (Batch, Length, 1)
-        #plot_time_series(target_data_padded, positive_data_padded, batch_idx)
+        target_data_padded = target_data_padde[:,:,2:3].to(device)  #  (Batch, Length, 1)
+        positive_data_padded = positive_data_padde[:,:,2:3].to(device)  #  (Batch, Length, 1)
         teacher_input = positive_data_padded
         student_input = target_data_padded
+        # Try use the same model
         teacher_outputs = teacher([teacher_input], local_group_memory_inputs={"mem": teacher_mem}, return_target=True)
-        student_outputs = student([student_input], local_group_memory_inputs={"mem": student_mem}, return_target=False)
+        student_outputs = student([student_input], local_group_memory_inputs={"mem": student_mem}, return_target=False) 
 
-        # Outputs
         teacher_instance_target, teacher_local_group_target, teacher_group_target, teacher_memory_tokens = teacher_outputs
         student_instance_target, student_local_group_target, student_group_target, student_memory_tokens = student_outputs
 
@@ -190,8 +193,8 @@ def train_one_epoch(
             granular_losses["group-sup."] = group_loss.item()
         total_loss /= weigts_sum
     
-        # Update the memory buffer 
-        student_features = student_memory_tokens
+        # Update the memory  
+        student_features = student_memory_tokens # Should be the patch token
         student_mem._dequeue_and_enqueue(student_features)
         teacher_mem._dequeue_and_enqueue(teacher_memory_tokens)
         
@@ -206,9 +209,9 @@ def train_one_epoch(
             torch.nn.utils.clip_grad_norm_(student.parameters(), args.clip_grad)
         optimizer.step()
 
-        # EMA update for the teacher
+        # EMA update for teacher
         with torch.no_grad():
-            m = 0.2  # momentum parameter
+            m = 0.1  # momentum parameter
             for param_q, param_k in zip(
                 student.backbone.parameters(),
                 teacher.backbone.parameters(),
@@ -236,7 +239,6 @@ def train_one_epoch(
                 ):
                     param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
 
-        # Logging
         metric_logger['loss'] += total_loss.item()
         if batch_idx % 10 == 0:
             log_results = ''

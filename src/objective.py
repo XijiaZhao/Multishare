@@ -3,84 +3,99 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class InfoNCELoss(nn.Module):
-    """
-    Vanilla InfoNCE loss adapted for time series data.
-    - ncrops: Number of crops used in student networks (set to 1 as per your setup)
-    - dim: Feature dimension in queue determined by output dimension of student network
-    - queue_size: Queue size
-    - temperature: Temperature parameter for InfoNCE loss
-    """
 
-    def __init__(self, ncrops=1, dim=256, queue_size=65536, temperature=0.2):
-        super().__init__()
-        self.queue_size = queue_size
+class ContrastiveLosses(nn.Module):
+    def __init__(self, margin=1.0, feature_dim=256, queue_size=128, temperature=0.1):
+        super(ContrastiveLosses, self).__init__()
+        self.buffer_size = queue_size
         self.temperature = temperature
-
-        # Create the queue
-        self.register_buffer("queue", torch.randn(dim, queue_size))
-        self.queue = nn.functional.normalize(self.queue, dim=0)
-
-        self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
-        self.CrossEntropyLoss = nn.CrossEntropyLoss()
-        self.ncrops = ncrops
-
-    @torch.no_grad()
-    def _dequeue_and_enqueue(self, keys):
+        self.margin = margin
+        
+        # Initialize a buffer to store negative samples (FIFO)
+        self.register_buffer("buffer", torch.randn(queue_size, feature_dim))
+        self.buffer_ptr = 0  # Pointer to track buffer position
         """
-        Queue update
+        Initialize the ContrastiveLosses class.
+
+        :param margin: Margin for contrastive loss. Default is 1.0.
         """
-        batch_size = keys.shape[0]
-        ptr = int(self.queue_ptr)
-        if ptr + batch_size <= self.queue_size:
-            self.queue[:, ptr : ptr + batch_size] = keys.T
-            ptr = (ptr + batch_size) % self.queue_size
-        else:
-            keys_t = keys.T
-            queue_remaining_size = self.queue_size - ptr
-            self.queue[:, ptr:] = keys_t[:, :queue_remaining_size]
-            self.queue[:, : batch_size - queue_remaining_size] = keys_t[
-                :, queue_remaining_size:
-            ]
-            ptr = batch_size - queue_remaining_size  # Move pointer
+    def forward(self, out1, out2):
+        
+        batch_size = out1.size(0)
+        
+        """ # Normalize the feature vectors
+        out1 = F.normalize(out1, dim=1)
+        out2 = F.normalize(out2, dim=1) """
+     
+        distance = F.pairwise_distance(out1, out2)
+        positive_loss = torch.mean(torch.pow(distance, 2))
 
-        self.queue_ptr[0] = ptr
-
-    def forward(self, student_output, teacher_output):
-        """
-        Compute InfoNCE loss between student and teacher outputs.
-        """
-        # Normalize outputs
-        student_output = nn.functional.normalize(student_output, dim=-1)
-        teacher_output = nn.functional.normalize(teacher_output.detach(), dim=-1)
-       
-        queue_feat = self.queue.clone().detach()
-        # Positive logits: Nx1
-        l_pos = torch.einsum("nc,nc->n", [student_output, teacher_output]).unsqueeze(-1)
-        # Negative logits: NxK
-        #print(student_output.size,queue_feat.size)
-        l_neg = torch.einsum("nc,ck->nk", [student_output, queue_feat])
-
-        # Logits: Nx(1+K)
-        logits = torch.cat([l_pos, l_neg], dim=1)
-        # Apply temperature
-        logits /= self.temperature
-        # Labels: positive key indicators
-        labels = torch.zeros(logits.shape[0], dtype=torch.long).to(logits.device)
-        loss = self.CrossEntropyLoss(logits, labels)
-        self._dequeue_and_enqueue(teacher_output)
-
+        # Select a batch from the memory buffer 
+        buffer_negatives = self._sample_from_buffer(batch_size)
+        negative_pair_distance = F.pairwise_distance(out2, buffer_negatives)
+        buffer_loss = torch.mean(torch.pow(torch.clamp(self.margin - negative_pair_distance, min=0.0), 2))
+        loss = positive_loss+buffer_loss
+        self._update_buffer(out1)
+          
         return loss
+    def _sample_from_buffer(self, batch_size):
+        # Randomly sample a batch
+        buffer_size = self.buffer.size(0)
+        indices = torch.randint(0, buffer_size, (batch_size,))
+        #print(indices)
+        return self.buffer[indices]
+    def _update_buffer(self, new_entries):
+        batch_size = new_entries.size(0)
+        if self.buffer_ptr + batch_size > self.buffer_size:
+            # If buffer overflows, wrap around (FIFO)
+            overflow = (self.buffer_ptr + batch_size) - self.buffer_size
+            self.buffer[self.buffer_ptr:] = new_entries[:batch_size-overflow]
+            self.buffer[:overflow] = new_entries[batch_size-overflow:]
+            self.buffer_ptr = overflow
+        else:
+            self.buffer[self.buffer_ptr:self.buffer_ptr+batch_size] = new_entries
+            self.buffer_ptr = (self.buffer_ptr + batch_size) % self.buffer_size
+
 
 class InstanceDiscriminationLoss(nn.Module):
     def __init__(self, feature_dim=256, queue_size=512, temperature=0.07):
         super(InstanceDiscriminationLoss, self).__init__()
         self.buffer_size = queue_size
         self.temperature = temperature
-        # Initialize a buffer to store negative samples (FIFO)
+        # Initialize a buffer 
         self.register_buffer("buffer", torch.randn(queue_size, feature_dim))
         self.buffer_ptr = 0  # Pointer to track buffer position
+
+    """ def forward(self, z1, z2):
         
+        #z1: Tensor, shape (batch_size, feature_dim) - features from the teacher (h_t_in(y_c1))
+        #z2: Tensor, shape (batch_size, feature_dim) - features from the student's prediction head (pin(h_s_in(y_c2)))
+        
+        batch_size = z1.size(0)
+        
+        # Normalize the feature vectors
+        z1 = F.normalize(z1, dim=1)
+        z2 = F.normalize(z2, dim=1) #(batch,dim)
+
+        # Cosine similarity (z1, z2)
+        pos_sim = torch.exp(torch.sum(z1 * z2, dim=-1) / self.temperature) #([16])
+
+        # Negative keys from the buffer
+        buffer_negatives = self.buffer[:self.buffer_size].detach()  # (buffer_size, feature_dim)
+        buffer_negatives = F.normalize(buffer_negatives, dim=1)
+        # Probably don't need the norm of buffer again
+
+        # Compute cosine similarity for negative pairs (z2, buffer_negatives)
+        neg_sim = torch.exp(torch.mm(z2, buffer_negatives.T) / self.temperature)  # (batch_size, buffer_size)
+         
+        # Compute the InfoNCE loss
+        numerator = pos_sim
+        denominator = torch.cat([neg_sim, pos_sim.unsqueeze(1)], dim=1).sum(dim=1) # (batch)
+        loss = -torch.log(numerator / denominator).mean()
+          # Update the buffer with the new z1s
+        self._update_buffer(z1)
+        
+        return loss """
     def forward(self, z1, z2):
         """
         z1: Tensor, shape (batch_size, feature_dim) - features from the teacher (h_t_in(y_c1))
@@ -89,26 +104,28 @@ class InstanceDiscriminationLoss(nn.Module):
         batch_size = z1.size(0)
         
         # Normalize the feature vectors
-        z1 = F.normalize(z1, dim=1)
-        z2 = F.normalize(z2, dim=1)
-
-        # Compute positive cosine similarity (z1, z2)
-        pos_sim = torch.exp(torch.sum(z1 * z2, dim=-1) / self.temperature)
-
-        # Sample negative keys from the buffer
-        buffer_negatives = self.buffer[:self.buffer_size].detach()  # (buffer_size, feature_dim)
-        buffer_negatives = F.normalize(buffer_negatives, dim=1)
-        
-        # Compute cosine similarity for negative pairs (z2, buffer_negatives)
-        neg_sim = torch.exp(torch.mm(z2, buffer_negatives.T) / self.temperature)  # (batch_size, buffer_size)
-        
-        # Compute the InfoNCE loss
+        #z1 = F.normalize(z1, dim=1)
+        #z2 = F.normalize(z2, dim=1)
+        # Cos (z1, z2)
+        pos_sim = torch.exp(torch.sum(z1 * z2, dim=-1) / self.temperature)  # Shape: [batch_size]
         numerator = pos_sim
-        denominator = torch.cat([neg_sim, pos_sim.unsqueeze(1)], dim=1).sum(dim=1)
-        loss = -torch.log(numerator / denominator).mean()
-          # Update the buffer with the new z1s
-        self._update_buffer(z1)
         
+        # Initialize denominator with the positive pair similarity
+        denominator = numerator.clone()
+        buffer_negatives = self.buffer[:self.buffer_size].detach()  # (buffer_size, feature_dim)
+        buffer_negatives = buffer_negatives.clone().detach()
+
+        for i in range(0, self.buffer_size, batch_size):
+            buffer_subset = buffer_negatives[i:i + batch_size]
+            if buffer_subset.size(0) < batch_size:
+                break
+            # Compute cos (z2 , buffer_subset)
+            neg_sim = torch.exp(torch.sum(z2 * buffer_subset, dim=-1) / self.temperature)  #  [batch_size]
+            denominator += neg_sim
+
+        loss = -torch.log(numerator / denominator).mean()
+        self._update_buffer(z1)
+
         return loss
     
     def _update_buffer(self, new_entries):
@@ -222,7 +239,7 @@ def get_multi_granular_loss(args):
     all_losses["local-group-sup."] = local_group_supervision
     all_weights["local-group-sup."] = args.loss_weights[1]
     """
-    instance_supervision_loss = InstanceDiscriminationLoss(
+    instance_supervision_loss = ContrastiveLosses(
         feature_dim=args.instance_out_dim,
         queue_size=args.instance_queue_size,
         temperature=args.instance_temp,
@@ -231,7 +248,7 @@ def get_multi_granular_loss(args):
     all_weights["instance-sup."] = args.loss_weights[0]
 
     ## local group discrimination loss
-    local_group_supervision = InstanceDiscriminationLoss(
+    local_group_supervision = ContrastiveLosses(
         feature_dim=args.local_group_out_dim,
         queue_size=args.local_group_queue_size,
         temperature=args.local_group_temp,
